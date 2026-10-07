@@ -1,0 +1,28 @@
+{
+  "name": "opencode-plugin-jev-prompt-assist",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "opencode plugin for the local Jev/System-1 (s1) classifier: prompt crafting, self-consistency verify, gate routing, project guides, token-efficient decisions, and a live TUI prompt-clarity panel.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/jev.ts",
+    "./tui": "./tui.tsx"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.31",
+    "@opentui/core": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "solid-js": "1.9.12"
+  },
+  "scripts": {
+    "build": "bun build src/jev.ts --target=bun --outdir=dist",
+    "check:tui": "bun build tui.tsx --target=bun --outdir=dist-tui",
+    "test": "bun test tests",
+    "install:opencode": "./install.sh",
+    "uninstall:opencode": "./uninstall.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4"
+  }
+}

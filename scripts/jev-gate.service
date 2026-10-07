@@ -1,0 +1,18 @@
+[Unit]
+Description=Jev gate classifier (lightweight CPU endpoint for the opencode jev plugin)
+Documentation=file:/home/kr/Projects/Plugins/jev-prompt-assist/PLAN.md
+After=network.target
+
+[Service]
+Type=simple
+# Never touch the GPU: this is the cheap CPU gate.
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=JEV_GATE_MODEL_PATH=/home/kr/Models/active/jevify-gemma4-e4b.Q4_K_M.gguf
+Environment=JEV_GATE_PORT=8082
+Environment=JEV_GATE_THREADS=4
+ExecStart=/home/kr/Projects/Plugins/jev-prompt-assist/scripts/jev-gate-serve.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

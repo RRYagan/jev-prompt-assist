@@ -1,0 +1,9 @@
+{
+  "fast": false,
+  "intentHint": true,
+  "guide": true,
+  "cache": true,
+  "maxStateChars": 4000,
+  "gateBaseUrl": "http://127.0.0.1:8082/v1",
+  "gateModel": "jevify-gemma4-e4b"
+}
