@@ -17,6 +17,9 @@ import { loadLiveConfig, type LiveConfig } from "./lib/tui/config"
 import { heuristicAnalysis, mergeAnalysis, type Analysis } from "./lib/tui/analyze"
 import { scoreWithS1 } from "./lib/tui/s1"
 import { loadLexicon } from "./lib/tui/lexicon"
+import { lintSte, type StyleIssue } from "./lib/tui/style"
+import { lintGrammar } from "./lib/tui/grammar"
+import { loadSteData } from "./lib/tui/ste100"
 import {
   basename,
   currentFragment,
@@ -34,6 +37,23 @@ type TuiApi = Parameters<TuiPluginModule["tui"]>[0]
 // value, so the panel's render path has no null dereferences (the old
 // `state()!.tips` crash).
 const EMPTY: Analysis = { score: 0, level: "weak", segments: [], tips: [], tier: "heuristic" }
+
+const SEVERITY_MARK: Record<StyleIssue["severity"], string> = { error: "✖", warn: "▲", info: "•" }
+
+/** Convert a style/grammar finding into a list entry. Value is "" for advisories. */
+function issueToSuggestion(issue: StyleIssue): Suggestion {
+  const mark = SEVERITY_MARK[issue.severity]
+  return {
+    value: issue.replacement ?? "",
+    label: issue.replacement
+      ? `${mark} ${issue.label} → ${issue.replacement}`
+      : `${mark} ${issue.label}`,
+    detail: `${issue.rule} · ${issue.detail}`,
+    kind: "style",
+    span: issue.span,
+    severity: issue.severity,
+  }
+}
 
 // State shared between the rendered prompt and the global keymap layer (the
 // accept/cycle bindings run outside the component, so they need the live ref,
@@ -62,11 +82,28 @@ function acceptSuggestion(shared: Shared): void {
     const ref = shared.ref
     const list = shared.items()
     const item = list[shared.selected() ?? 0]
-    const fragment = shared.fragment
-    if (!ref || !item || !fragment) return
+    if (!ref || !item) return
     const current = ref.current
     const input = current?.input ?? ""
-    if (!input.endsWith(fragment)) return
+
+    // Style/grammar finding: replace its exact source span. Advisories (no
+    // replacement) are not actionable, so accepting one is a no-op.
+    if (item.span) {
+      if (!item.value) return
+      const { start, end } = item.span
+      if (start < 0 || end > input.length || end <= start) return
+      const next = input.slice(0, start) + item.value + input.slice(end)
+      ref.set({ input: next, parts: current?.parts ?? [] })
+      ref.focus()
+      shared.setItems([])
+      shared.setSelected(0)
+      shared.suppress = next
+      shared.fragment = ""
+      return
+    }
+
+    const fragment = shared.fragment
+    if (!fragment || !input.endsWith(fragment)) return
     const next = input.slice(0, input.length - fragment.length) + item.value
     ref.set({ input: next, parts: current?.parts ?? [] })
     ref.focus()
@@ -270,7 +307,7 @@ function PromptWithPanel(props: PanelProps) {
       const merged = [...props.shared.items()]
       const seen = new Set(merged.map((item) => item.value))
       for (const item of extra) {
-        if (merged.length >= props.cfg.suggestLimit) break
+        if (merged.length >= props.cfg.suggestLimit + 8) break
         if (seen.has(item.value)) continue
         seen.add(item.value)
         merged.push(item)
@@ -279,9 +316,52 @@ function PromptWithPanel(props: PanelProps) {
     })
   }
 
-  const updateSuggestions = (input: string, gen: number) => {
+  // Style (STE) + grammar findings, converted to list entries. Best-effort:
+  // a missing dictionary or a rule error never breaks the panel.
+  const collectFindings = (input: string): Suggestion[] => {
+    if (!props.cfg.style && !props.cfg.grammar) return []
+    const out: Suggestion[] = []
+    try {
+      if (props.cfg.grammar) {
+        out.push(...lintGrammar(input, { limit: props.cfg.grammarLimit }).map(issueToSuggestion))
+      }
+      if (props.cfg.style) {
+        const data = loadSteData({
+          dictionary: props.cfg.steDictionary || undefined,
+          glossary: props.cfg.glossary || undefined,
+        })
+        if (data.loaded) {
+          out.push(
+            ...lintSte(input, {
+              data,
+              maxInstructionWords: props.cfg.steMaxInstructionWords,
+              maxDescriptiveWords: props.cfg.steMaxDescriptiveWords,
+              flagUnknown: props.cfg.steFlagUnknown,
+              limit: props.cfg.styleLimit,
+            }).map(issueToSuggestion),
+          )
+        }
+      }
+    } catch {
+      // findings are best-effort
+    }
+    out.sort((a, b) => (a.span?.start ?? 0) - (b.span?.start ?? 0))
+    const dedup = new Set<string>()
+    return out.filter((item) => {
+      const key = `${item.span?.start ?? -1}:${item.span?.end ?? -1}:${item.label}`
+      if (dedup.has(key)) return false
+      dedup.add(key)
+      return true
+    })
+  }
+
+  const updateAssists = (input: string, gen: number) => {
+    const findings = collectFindings(input)
+    props.shared.fragment = ""
+    props.shared.mention = false
+
     if (!props.cfg.suggest) {
-      props.shared.setItems([])
+      props.shared.setItems(findings)
       return
     }
     const mentionToken = props.cfg.mention ? currentMention(input) : undefined
@@ -294,7 +374,7 @@ function PromptWithPanel(props: PanelProps) {
     const query = mention ? fragment.slice(1) : fragment
     const min = mention ? 1 : props.cfg.suggestMinChars
     if (query.length < min) {
-      props.shared.setItems([])
+      props.shared.setItems(findings)
       return
     }
 
@@ -310,7 +390,8 @@ function PromptWithPanel(props: PanelProps) {
         })
       }
     }
-    props.shared.setItems(list)
+    // Findings rank ahead of name completions.
+    props.shared.setItems([...findings, ...list].slice(0, Math.max(1, props.cfg.suggestLimit + 8)))
 
     if (props.cfg.suggestSources !== "idx") {
       suggestDebounce = setTimeout(() => runServer(query, mention, gen), props.cfg.suggestDebounceMs)
@@ -334,7 +415,7 @@ function PromptWithPanel(props: PanelProps) {
       suggestDebounce = undefined
     }
 
-    updateSuggestions(input, gen)
+    updateAssists(input, gen)
 
     if (!input || input.length < props.cfg.minChars) {
       setAnalysis(EMPTY)
@@ -360,6 +441,14 @@ function PromptWithPanel(props: PanelProps) {
     props.shared.setItems([
       { value: "deployPanels", label: "deployPanels", detail: "function · src/panel.ts", kind: "symbol" },
       { value: "@src/deploy.ts", label: "deploy.ts", detail: "src", kind: "mention" },
+      {
+        value: "receive",
+        label: "▲ spelling → receive",
+        detail: "GM-spelling · use “receive”",
+        kind: "style",
+        span: { start: 0, end: 7 },
+        severity: "warn",
+      },
     ])
   }
   if (props.sessionID) {
@@ -430,7 +519,7 @@ const tui: TuiPluginModule["tui"] = async (api) => {
     accept: () => acceptSuggestion(shared),
     move: (delta) => moveSelection(shared, delta),
   }
-  if (cfg.suggest) {
+  if (cfg.suggest || cfg.style || cfg.grammar) {
     const bindings: Array<{ key: string; cmd: string }> = []
     if (cfg.acceptKey) bindings.push({ key: cfg.acceptKey, cmd: "jev.acceptSuggestion" })
     if (cfg.suggestNextKey) bindings.push({ key: cfg.suggestNextKey, cmd: "jev.nextSuggestion" })

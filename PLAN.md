@@ -1,8 +1,8 @@
 # Jev / System-1 plugin for opencode + dsh — plan & analysis
 
-Status: **v4 implemented** (opencode-only, per user scope): server plugin v2 + a
-terminal-TUI **live prompt panel** with **project-context autosuggest**. dsh
-bridge = deferred (phase 2).
+Status: **v5 implemented** (opencode-only, per user scope): server plugin v2 + a
+terminal-TUI **live prompt panel** with **project-context autosuggest** and
+**ASD-STE100 + grammar writing checks**. dsh bridge = deferred (phase 2).
 **Desktop/web is intentionally out of scope** — the live panel is terminal-TUI only.
 Author context: opencode, local-first, CPU-first (`-ngl 0`), zero paid tokens.
 
@@ -143,7 +143,9 @@ tui.tsx                              # TUI half: registers the live prompt panel
 lib/tui/                             #   config.ts, analyze.ts (heuristics),
                                      #   s1.ts (debounced model scoring),
                                      #   lexicon.ts (idx SQLite lexicon),
-                                     #   suggest.ts (fragment matching), panel.tsx
+                                     #   suggest.ts (fragment matching),
+                                     #   ste100.ts (ASD data), style.ts (STE rules),
+                                     #   grammar.ts (safe grammar), panel.tsx
 command/jev.md                       # /jev command
 scripts/                             # CPU gate model (Q4_K_M) + systemd unit
   requant-q4.sh                      #   llama-quantize Q5_K_M -> Q4_K_M
@@ -153,7 +155,8 @@ scripts/                             # CPU gate model (Q4_K_M) + systemd unit
   uninstall-gate.sh                  #   disable + remove (keeps model file)
   config.example.json                #   template for ~/.config/opencode/jev/config.json
   tui-entry.mjs                      #   add/remove the tui.json plugin entry
-tests/                                 # analyze + suggest + lexicon + panel render tests
+  ste100-fetch.mjs                   #   download the private ASD Issue 9 dataset
+tests/                                 # analyze/suggest/lexicon/style/grammar/ste100 + panel
 dsh/dsh-hook.mjs                     # phase-2 scaffolding (deferred, unwired)
 package.json                         # @opencode-ai/plugin + @opentui/{core,solid} deps
 install.sh / uninstall.sh            # symlink install + tui.json entry management
@@ -234,12 +237,18 @@ idempotently, preserving other entries; `uninstall.sh` removes it.
             "suggestSources": "both", "mention": true, "suggestDebounceMs": 250,
             "acceptKey": "alt+s", "suggestNextKey": "alt+n",
             "suggestPrevKey": "alt+p",
+            "style": true, "styleLimit": 6, "grammar": true, "grammarLimit": 6,
+            "styleProfile": "ste", "steDictionary": "", "glossary": "",
+            "steMaxInstructionWords": 20, "steMaxDescriptiveWords": 25,
+            "steFlagUnknown": false,
             "gateBaseUrl": "http://127.0.0.1:8082/v1",
             "gateModel": "jevify-gemma4-e4b" } }
 ```
 
 Env: `JEV_LIVE=0` disable, `JEV_SUGGEST=0` disable suggestions,
-`JEV_MENTION=0` disable `@`-mentions, plus `JEV_GATE_BASE_URL` /
+`JEV_MENTION=0` disable `@`-mentions, `JEV_STYLE=0` disable STE checks,
+`JEV_GRAMMAR=0` disable grammar, `JEV_STE_DICT` / `JEV_GLOSSARY` data paths,
+`JEV_STE_UNKNOWN=1` flag unknown words, plus `JEV_GATE_BASE_URL` /
 `JEV_GATE_MODEL`. Debug: `JEV_TUI_DEBUG=1` (stderr traces),
 `JEV_TUI_SELFTEST=1` (render a fixture below the prompt without typing). Any
 key may be set to `""` to disable that binding.
@@ -258,6 +267,22 @@ cursor API, so the end of the draft is the implicit cursor. `acceptKey` /
 `TuiPromptRef.set`. Absent or unfinished indexes (`status` not in
 `completed`/`ready`) are ignored gracefully.
 
+**Writing checks (ASD-STE100 + grammar):** `lib/tui/style.ts` is a TypeScript
+port of the 53 Issue 9 rules plus GR-1..8, driven by `lib/tui/ste100.ts`. The
+data layer loads the full ASD Issue 9 dataset (876 approved / 1,319
+non-approved words) from `~/.config/opencode/jev/ste100/dictionary.json`, plus a
+`glossary.txt`. `scripts/ste100-fetch.mjs` downloads the dataset into that
+private dir; it is **never committed** because the ASD text is copyright. A tiny
+in-repo seed keeps the checker usable with no dataset. Mechanical rules carry a
+`replacement` (accept splices it into the issue span); judgement rules are
+advisory notes. `lib/tui/grammar.ts` adds a high-confidence general tier
+(repeated words, `its'`, `then`/`than`, `affect`/`effect`, `a`/`an`, sentence
+case, double spaces, unmatched brackets/quotes, a small misspelling table).
+Findings merge ahead of completions in the same list, capped per source.
+`RULE_COVERAGE` marks each rule auto / advisory / manual, and
+`tests/style.test.ts` asserts every one of the 53 rule ids is accounted for
+(spot-checks: 1.1 and 4.2 auto; 5.1 advisory).
+
 **Crash-safety:** the panel render path is total (no non-null assertions — the
 old `state()!.tips` reads crashed the TUI when the draft was typed then
 cleared) and is wrapped in a Solid `<ErrorBoundary>` so a fault degrades to
@@ -273,9 +298,12 @@ and is not implemented here.
 - Server plugin: `bun build src/jev.ts --target=bun`; TUI half:
   `bun build tui.tsx --target=bun --packages external` (optional platform deps
   make a plain build fail — use `--packages external`).
-- `bun test tests` (heuristics + suggest matching + idx lexicon against a temp
-  SQLite fixture + a panel render/transition test), and tsc typecheck of
+- `bun test tests` (heuristics, suggest matching, idx lexicon against a temp
+  SQLite fixture, STE rule engine with the 53-rule coverage assertion, grammar,
+  STE data loader, and a panel render/transition test), and tsc typecheck of
   `tui.tsx` + `lib/tui/*`.
+- STE data: `node scripts/ste100-fetch.mjs` (downloads the private ASD dataset
+  into `~/.config/opencode/jev/ste100/`; never committed — ASD copyright).
 - `s1 doctor --cpu` (endpoint + model + card example).
 - Gate: `scripts/setup-gate.sh` then `s1 noul --base-url http://127.0.0.1:8082/v1
   --model jevify-gemma4-e4b --state ... --question ...`.

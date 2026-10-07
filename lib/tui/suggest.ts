@@ -23,16 +23,22 @@ export type Lexicon = {
   paths: string[]
 }
 
-export type SuggestionKind = "symbol" | "path" | "mention"
+export type SuggestionKind = "symbol" | "path" | "mention" | "style"
+
+export type SuggestionSeverity = "error" | "warn" | "info"
 
 export type Suggestion = {
-  /** Text substituted for the typed fragment. */
+  /** Text substituted for the typed fragment (completions) or the span (style). */
   value: string
   /** Short display label. */
   label: string
   /** Secondary context, e.g. "function · src/panel.tsx". */
   detail?: string
   kind: SuggestionKind
+  /** Source range to replace, for style/grammar findings. */
+  span?: { start: number; end: number }
+  /** Severity, for style/grammar findings (drives colour). */
+  severity?: SuggestionSeverity
 }
 
 export type SuggestOptions = {

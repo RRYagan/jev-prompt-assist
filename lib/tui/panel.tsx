@@ -22,6 +22,14 @@ function clip(text: string, max = 80): string {
   return compact.length > max ? compact.slice(0, max - 1) + "…" : compact
 }
 
+/** Colour for an unselected item: severity for findings, muted for completions. */
+function itemColor(item: Suggestion, theme: TuiThemeCurrent) {
+  if (item.severity === "error") return theme.error
+  if (item.severity === "warn") return theme.warning
+  if (item.severity === "info") return theme.info
+  return theme.textMuted
+}
+
 export function LivePanel(props: {
   analysis: Accessor<Analysis | undefined>
   busy: Accessor<boolean>
@@ -87,7 +95,7 @@ export function LivePanel(props: {
               <text fg={index === selectedIndex() ? props.theme.accent : props.theme.textMuted}>
                 {index === selectedIndex() ? "▸ " : "  "}
               </text>
-              <text fg={index === selectedIndex() ? props.theme.text : props.theme.textMuted}>
+              <text fg={index === selectedIndex() ? props.theme.text : itemColor(item, props.theme)}>
                 {item.label}
               </text>
               {item.detail ? (

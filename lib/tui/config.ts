@@ -38,6 +38,26 @@ export type LiveConfig = {
   suggestNextKey: string
   /** Key that selects the previous suggestion. */
   suggestPrevKey: string
+  /** Enable the ASD-STE100 style checker (findings in the suggestion list). */
+  style: boolean
+  /** Style profile; only "ste" is implemented. */
+  styleProfile: "ste"
+  /** Override path to the STE dictionary JSON (default: config dir). */
+  steDictionary: string
+  /** Override path to a glossary file (default: config dir glossary.txt). */
+  glossary: string
+  /** Maximum words in a procedural (instruction) sentence. */
+  steMaxInstructionWords: number
+  /** Maximum words in a descriptive sentence. */
+  steMaxDescriptiveWords: number
+  /** Also flag words absent from the dictionary (Rules 1.5/1.12; noisy). */
+  steFlagUnknown: boolean
+  /** Maximum style findings to show. */
+  styleLimit: number
+  /** Enable the safe general-grammar tier. */
+  grammar: boolean
+  /** Maximum grammar findings to show. */
+  grammarLimit: number
   /** OpenAI-compatible endpoint for the classifier. */
   gateBaseUrl: string
   /** Model alias served at gateBaseUrl. */
@@ -86,6 +106,19 @@ export function loadLiveConfig(): LiveConfig {
     acceptKey: typeof live.acceptKey === "string" ? live.acceptKey : "alt+s",
     suggestNextKey: typeof live.suggestNextKey === "string" ? live.suggestNextKey : "alt+n",
     suggestPrevKey: typeof live.suggestPrevKey === "string" ? live.suggestPrevKey : "alt+p",
+    style: envBool("JEV_STYLE", bool(live.style, true)),
+    styleProfile: "ste",
+    steDictionary:
+      process.env.JEV_STE_DICT ??
+      (typeof live.steDictionary === "string" ? live.steDictionary : ""),
+    glossary:
+      process.env.JEV_GLOSSARY ?? (typeof live.glossary === "string" ? live.glossary : ""),
+    steMaxInstructionWords: num(live.steMaxInstructionWords, 20),
+    steMaxDescriptiveWords: num(live.steMaxDescriptiveWords, 25),
+    steFlagUnknown: envBool("JEV_STE_UNKNOWN", bool(live.steFlagUnknown, false)),
+    styleLimit: num(live.styleLimit, 6),
+    grammar: envBool("JEV_GRAMMAR", bool(live.grammar, true)),
+    grammarLimit: num(live.grammarLimit, 6),
     gateBaseUrl:
       process.env.JEV_GATE_BASE_URL ??
       (typeof raw.gateBaseUrl === "string" ? raw.gateBaseUrl : "http://127.0.0.1:8082/v1"),

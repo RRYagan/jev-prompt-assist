@@ -23,6 +23,7 @@ well, route them, and feed the results back into the session.
 | Deterministic params | `chat.params` (`JEV_PARAMS=1`) | Pins temperature ≤0.2 for judge/review/plan/compaction/test-gen. |
 | Live prompt panel | `tui.tsx` (TUI plugin) | As you type, colours each sentence, shows a `score/100`, and suggests fixes. **Terminal TUI only.** |
 | Project autosuggest | `tui.tsx` + idx/server (`lib/tui/suggest.ts`) | Ranked `did you mean:` symbol/file matches (prefix/camelCase/subsequence/typo), `@`-mention mode, hot+recent boosts; cycle with `alt+n/p` and accept with `alt+s`. **Terminal TUI only.** |
+| Writing checks | `tui.tsx` + `lib/tui/style.ts`, `grammar.ts` | Flags ASD-STE100 and safe grammar problems in the same list; accepting a mechanical fix splices its replacement into the span. **Terminal TUI only.** |
 
 ## Layout
 
@@ -30,10 +31,12 @@ well, route them, and feed the results back into the session.
 src/jev.ts            canonical server plugin (installed via symlink)
 tui.tsx               canonical TUI plugin: the live prompt panel
 lib/tui/              config.ts, analyze.ts (heuristics), s1.ts (model),
-                      lexicon.ts (idx SQLite lexicon), suggest.ts (matching), panel.tsx
+                      lexicon.ts (idx SQLite lexicon), suggest.ts (matching),
+                      ste100.ts (ASD data), style.ts (STE rules),
+                      grammar.ts (safe grammar), panel.tsx
 command/jev.md        canonical /jev command
-scripts/              CPU gate model + tui-entry.mjs (manages the tui.json entry)
-tests/                analyze/suggest/lexicon pure tests
+scripts/              CPU gate model, tui-entry.mjs, ste100-fetch.mjs (dataset)
+tests/                analyze/suggest/lexicon/style/grammar/ste100 pure tests
 dsh/dsh-hook.mjs      phase-2 scaffolding (deferred, unwired)
 PLAN.md               full design + measurements
 install.sh            symlinks + adds the tui.json entry
@@ -83,6 +86,28 @@ The list shows as `did you mean:`; `alt+n` / `alt+p` cycle and
 `alt+s` accepts the selected candidate. Absent or unfinished indexes are
 ignored gracefully.
 
+The same list also flags **writing problems** ahead of the completions:
+
+- **ASD-STE100** (`lib/tui/style.ts`, a TypeScript port of the 53 Issue 9
+  rules + GR-1..8) — non-approved words with an approved substitute,
+  contractions, semicolons, passive voice, long sentences, noun clusters, and
+  more. Mechanical rules carry a `replacement`; judgement rules are advisories.
+- **General grammar** (`lib/tui/grammar.ts`) — a deliberately high-confidence
+  tier: repeated words, `its'`, `then`/`than`, `affect`/`effect`, `a`/`an`,
+  sentence case, double spaces, unmatched brackets/quotes, and a small
+  misspelling table.
+
+Findings render with a severity colour (error/warn/info) and their rule id.
+Pressing `alt+s` on a mechanical finding replaces its span; advisory findings
+do nothing. `style`/`grammar` can be toggled independently.
+
+The full ASD dataset (Issue 9: 876 approved, 1,319 non-approved words) lives at
+`~/.config/opencode/jev/ste100/dictionary.json`, fetched by
+`scripts/ste100-fetch.mjs`. It is **not** part of this repo — the ASD text is
+copyright and stays private. A glossary (`glossary.txt`) suppresses flags for
+your technical nouns; a small built-in seed keeps the checker usable with no
+dataset.
+
 Configure under the `live` key in `~/.config/opencode/jev/config.json`:
 
 ```json
@@ -92,12 +117,19 @@ Configure under the `live` key in `~/.config/opencode/jev/config.json`:
             "suggestSources": "both", "mention": true, "suggestDebounceMs": 250,
             "acceptKey": "alt+s", "suggestNextKey": "alt+n",
             "suggestPrevKey": "alt+p",
+            "style": true, "styleLimit": 6, "grammar": true, "grammarLimit": 6,
+            "styleProfile": "ste", "steDictionary": "", "glossary": "",
+            "steMaxInstructionWords": 20, "steMaxDescriptiveWords": 25,
+            "steFlagUnknown": false,
             "gateBaseUrl": "http://127.0.0.1:8082/v1",
             "gateModel": "jevify-gemma4-e4b" } }
 ```
 
 `JEV_LIVE=0` disables the panel; `JEV_SUGGEST=0` disables suggestions;
-`JEV_MENTION=0` disables `@`-mention mode. Debug: `JEV_TUI_DEBUG=1` (stderr
+`JEV_MENTION=0` disables `@`-mention mode; `JEV_STYLE=0` disables the STE
+checks; `JEV_GRAMMAR=0` disables the grammar tier; `JEV_STE_DICT` /
+`JEV_GLOSSARY` point at a dictionary/glossary; `JEV_STE_UNKNOWN=1` also flags
+unknown words. Debug: `JEV_TUI_DEBUG=1` (stderr
 traces), `JEV_TUI_SELFTEST=1` (render a fixture below the prompt without typing).
 Set any key to `""` to disable that binding; `suggestSources` accepts `"idx"`,
 `"server"`, or `"both"`.
@@ -158,4 +190,8 @@ s1 noul --base-url http://127.0.0.1:8082/v1 \
 - The panel render path is total (no non-null reads) and wrapped in a Solid
   `<ErrorBoundary>`, so a rendering fault degrades to "no panel" instead of
   crashing the TUI.
+- The ASD-STE100 dictionary and rule text are copyright ASD. The fetched
+  dataset stays in `~/.config/opencode/jev/ste100/` and is never committed to
+  this (MIT) repo. `tests/style.test.ts` asserts every one of the 53 rules is
+  accounted for as auto / advisory / manual.
 - dsh integration is **deferred** (opencode-only for now); see `PLAN.md` §7.
