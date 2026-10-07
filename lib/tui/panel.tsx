@@ -9,6 +9,7 @@
 import type { Accessor } from "solid-js"
 import type { TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { Analysis, Level } from "./analyze"
+import type { Suggestion } from "./suggest"
 
 function colorFor(level: Level, theme: TuiThemeCurrent) {
   if (level === "good") return theme.success
@@ -25,9 +26,12 @@ export function LivePanel(props: {
   analysis: Accessor<Analysis | undefined>
   busy: Accessor<boolean>
   error: Accessor<string | undefined>
-  suggestions: Accessor<string[]>
+  suggestions: Accessor<Suggestion[]>
+  selected: Accessor<number>
   /** Shown as a key hint next to suggestions; empty hides it. */
   acceptKey?: string
+  nextKey?: string
+  prevKey?: string
   theme: TuiThemeCurrent
 }) {
   // Every read is total: the analysis signal may be undefined between keystrokes
@@ -41,6 +45,19 @@ export function LivePanel(props: {
   const tier = () => s()?.tier ?? "heuristic"
   const tips = () => s()?.tips ?? []
   const status = () => (props.busy() ? "  scoring…" : tier() === "s1" ? "  classified" : "  instant")
+  const items = () => props.suggestions() ?? []
+  const selectedIndex = () => {
+    const count = items().length
+    if (count === 0) return 0
+    const index = props.selected() ?? 0
+    return Math.max(0, Math.min(index, count - 1))
+  }
+  const cycleHint = () => {
+    const parts: string[] = []
+    if (props.nextKey && props.prevKey) parts.push(`${props.nextKey}/${props.prevKey} cycle`)
+    if (props.acceptKey) parts.push(`${props.acceptKey} accept`)
+    return parts.length ? `  (${parts.join(", ")})` : ""
+  }
   return (
     <box flexDirection="column" paddingLeft={1}>
       {segments().length ? (
@@ -62,10 +79,23 @@ export function LivePanel(props: {
           ) : null}
         </>
       ) : null}
-      {props.suggestions().length ? (
-        <text fg={props.theme.textMuted}>{`did you mean: ${props.suggestions().join(", ")}${
-          props.acceptKey ? `  (${props.acceptKey} to accept)` : ""
-        }`}</text>
+      {items().length ? (
+        <box flexDirection="column">
+          <text fg={props.theme.textMuted}>{`did you mean:${cycleHint()}`}</text>
+          {items().map((item, index) => (
+            <box flexDirection="row">
+              <text fg={index === selectedIndex() ? props.theme.accent : props.theme.textMuted}>
+                {index === selectedIndex() ? "▸ " : "  "}
+              </text>
+              <text fg={index === selectedIndex() ? props.theme.text : props.theme.textMuted}>
+                {item.label}
+              </text>
+              {item.detail ? (
+                <text fg={props.theme.textMuted}>{`  ${item.detail}`}</text>
+              ) : null}
+            </box>
+          ))}
+        </box>
       ) : null}
     </box>
   )

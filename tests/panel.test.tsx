@@ -7,7 +7,9 @@ import { heuristicAnalysis, type Analysis } from "../lib/tui/analyze"
 import { LivePanel } from "../lib/tui/panel"
 
 const theme = {
+  text: "#eeeeee",
   textMuted: "#808080",
+  accent: "#5c9cf5",
   success: "#7fef8f",
   warning: "#f0a030",
   error: "#e06c75",
@@ -36,8 +38,14 @@ describe("LivePanel", () => {
         analysis={analysis}
         busy={() => false}
         error={() => undefined}
-        suggestions={() => ["deployPanels", "src/deploy.ts"]}
+        suggestions={() => [
+          { value: "deployPanels", label: "deployPanels", detail: "function", kind: "symbol" },
+          { value: "@src/deploy.ts", label: "deploy.ts", detail: "src", kind: "mention" },
+        ]}
+        selected={() => 0}
         acceptKey="ctrl+shift+s"
+        nextKey="ctrl+shift+n"
+        prevKey="ctrl+shift+p"
         theme={theme}
       />
     ))

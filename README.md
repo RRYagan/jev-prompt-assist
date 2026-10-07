@@ -22,7 +22,7 @@ well, route them, and feed the results back into the session.
 | Compaction safety | `experimental.session.compacting` | Carries the guide + recent decisions through compaction. |
 | Deterministic params | `chat.params` (`JEV_PARAMS=1`) | Pins temperature ≤0.2 for judge/review/plan/compaction/test-gen. |
 | Live prompt panel | `tui.tsx` (TUI plugin) | As you type, colours each sentence, shows a `score/100`, and suggests fixes. **Terminal TUI only.** |
-| Project autosuggest | `tui.tsx` + idx (`lib/tui/lexicon.ts`) | A `did you mean:` line of symbol/file matches from the project's idx index; optionally accept the top one with a key. **Terminal TUI only.** |
+| Project autosuggest | `tui.tsx` + idx/server (`lib/tui/suggest.ts`) | Ranked `did you mean:` symbol/file matches (prefix/camelCase/subsequence/typo), `@`-mention mode, hot+recent boosts; cycle with `ctrl+shift+n/p` and accept with `ctrl+shift+s`. **Terminal TUI only.** |
 
 ## Layout
 
@@ -66,27 +66,41 @@ Two tiers keep it responsive despite ~1 s CPU `s1` latency:
 2. **Debounced s1** — one batched `s1 ask` after `debounceMs` idle, merged at
    0.6 model / 0.4 heuristic and cached.
 
-A third, **model-free** source adds project-context suggestions: it reads the
-project's idx index (`<worktree>/.indexer-cli/db.sqlite`) directly with
-`bun:sqlite` (read-only, never spawning `idx`) to build an in-memory symbol/file
-lexicon. The trailing word you are typing is matched and a `did you mean:` line
-is shown; `ctrl+shift+s` rewrites that word to the top candidate. Absent or
-unfinished indexes are ignored gracefully.
+A third, **model-free** source adds project-context suggestions. It merges two
+fast sources:
+
+- **idx lexicon** — reads `<worktree>/.indexer-cli/db.sqlite` directly with
+  `bun:sqlite` (read-only; never spawns `idx`, which costs 10–54 s and takes a
+  lock) into an in-memory symbol/file list.
+- **opencode server** — a debounced `find.symbols`/`find.files` query, which
+  works even with no index and is always current.
+
+Matching is ranked: case-insensitive prefix → camelCase initialism (`gp` →
+`getProject`) → subsequence → substring → typo tolerance (edit distance 1).
+Files you are editing (git status) and identifiers already used earlier in the
+session are boosted. Typing `@` switches to file-mention mode (`@src/render.ts`).
+The list shows as `did you mean:`; `ctrl+shift+n` / `ctrl+shift+p` cycle and
+`ctrl+shift+s` accepts the selected candidate. Absent or unfinished indexes are
+ignored gracefully.
 
 Configure under the `live` key in `~/.config/opencode/jev/config.json`:
 
 ```json
 { "live": { "enabled": true, "debounceMs": 700, "pollMs": 150,
             "minChars": 12, "maxChars": 800, "model": true,
-            "suggest": true, "suggestLimit": 5, "acceptKey": "ctrl+shift+s",
+            "suggest": true, "suggestMinChars": 2, "suggestLimit": 5,
+            "suggestSources": "both", "mention": true, "suggestDebounceMs": 250,
+            "acceptKey": "ctrl+shift+s", "suggestNextKey": "ctrl+shift+n",
+            "suggestPrevKey": "ctrl+shift+p",
             "gateBaseUrl": "http://127.0.0.1:8082/v1",
             "gateModel": "jevify-gemma4-e4b" } }
 ```
 
-`JEV_LIVE=0` disables the panel; `JEV_SUGGEST=0` disables suggestions. Debug:
-`JEV_TUI_DEBUG=1` (stderr traces), `JEV_TUI_SELFTEST=1` (render a fixture below
-the prompt without typing). Set `acceptKey` to `""` to hide/disable the accept
-binding.
+`JEV_LIVE=0` disables the panel; `JEV_SUGGEST=0` disables suggestions;
+`JEV_MENTION=0` disables `@`-mention mode. Debug: `JEV_TUI_DEBUG=1` (stderr
+traces), `JEV_TUI_SELFTEST=1` (render a fixture below the prompt without typing).
+Set any key to `""` to disable that binding; `suggestSources` accepts `"idx"`,
+`"server"`, or `"both"`.
 
 > **Terminal TUI only.** The `@opentui/solid` slot API does not exist in the
 > desktop/web UI, so the live panel is intentionally not available there.

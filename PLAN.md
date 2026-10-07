@@ -230,22 +230,32 @@ idempotently, preserving other entries; `uninstall.sh` removes it.
 ```json
 { "live": { "enabled": true, "debounceMs": 700, "pollMs": 150,
             "minChars": 12, "maxChars": 800, "model": true,
-            "suggest": true, "suggestLimit": 5, "acceptKey": "ctrl+shift+s",
+            "suggest": true, "suggestMinChars": 2, "suggestLimit": 5,
+            "suggestSources": "both", "mention": true, "suggestDebounceMs": 250,
+            "acceptKey": "ctrl+shift+s", "suggestNextKey": "ctrl+shift+n",
+            "suggestPrevKey": "ctrl+shift+p",
             "gateBaseUrl": "http://127.0.0.1:8082/v1",
             "gateModel": "jevify-gemma4-e4b" } }
 ```
 
-Env: `JEV_LIVE=0` disable, `JEV_SUGGEST=0` disable suggestions, plus
-`JEV_GATE_BASE_URL` / `JEV_GATE_MODEL`. Debug: `JEV_TUI_DEBUG=1` (stderr traces),
-`JEV_TUI_SELFTEST=1` (render a fixture below the prompt without typing).
+Env: `JEV_LIVE=0` disable, `JEV_SUGGEST=0` disable suggestions,
+`JEV_MENTION=0` disable `@`-mentions, plus `JEV_GATE_BASE_URL` /
+`JEV_GATE_MODEL`. Debug: `JEV_TUI_DEBUG=1` (stderr traces),
+`JEV_TUI_SELFTEST=1` (render a fixture below the prompt without typing). Any
+key may be set to `""` to disable that binding.
 
-**Project-context autosuggest:** a model-free third source reads the project's
-idx index (`<worktree>/.indexer-cli/db.sqlite`) directly with `bun:sqlite`
-(read-only; never spawn `idx`, which costs 10–54 s and takes a lock) to build an
-in-memory symbol/file lexicon (`lib/tui/lexicon.ts`). The trailing word (the
-implicit "cursor" — there is no cursor API) is matched (`lib/tui/suggest.ts`)
-and shown as a `did you mean:` line; `acceptKey` rewrites that word via
-`TuiPromptRef.set`. Indexes that are absent or unfinished (`status` not in
+**Project-context autosuggest:** a model-free source with two feeds — the idx
+lexicon (`lib/tui/lexicon.ts`, a direct read-only `bun:sqlite` open of
+`<worktree>/.indexer-cli/db.sqlite`; never spawn `idx`, which costs 10–54 s and
+takes a lock) and a debounced `api.client.find.symbols`/`find.files` query
+(`suggestSources`: `idx` | `server` | `both`). `lib/tui/suggest.ts` ranks
+candidates by prefix → camelCase initialism → subsequence → substring → typo
+tolerance (edit distance 1), boosting files in git status and identifiers seen
+earlier in the session; a prebuilt index (WeakMap-cached, binary-searched) keeps
+it per-keystroke. A trailing `@` switches to file-mention mode. There is no
+cursor API, so the end of the draft is the implicit cursor. `acceptKey` /
+`suggestNextKey` / `suggestPrevKey` rewrite/cycle the fragment via
+`TuiPromptRef.set`. Absent or unfinished indexes (`status` not in
 `completed`/`ready`) are ignored gracefully.
 
 **Crash-safety:** the panel render path is total (no non-null assertions — the

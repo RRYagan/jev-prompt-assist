@@ -20,12 +20,24 @@ export type LiveConfig = {
   maxChars: number
   /** Enable the debounced s1 tier (tier 2) on top of instant heuristics. */
   useModel: boolean
-  /** Enable project-context autosuggest (symbol/file hints) from the idx index. */
+  /** Enable project-context autosuggest (symbol/file hints). */
   suggest: boolean
+  /** Minimum fragment length before suggestions appear. */
+  suggestMinChars: number
   /** Maximum number of autosuggest candidates to show. */
   suggestLimit: number
-  /** Key that accepts the top suggestion (empty string disables the binding). */
+  /** Which sources to use: the idx lexicon, the server find API, or both. */
+  suggestSources: "idx" | "server" | "both"
+  /** Suggest file paths as `@mentions`. */
+  mention: boolean
+  /** Quiet period before the async server lookup runs. */
+  suggestDebounceMs: number
+  /** Key that accepts the selected suggestion (empty string disables). */
   acceptKey: string
+  /** Key that selects the next suggestion. */
+  suggestNextKey: string
+  /** Key that selects the previous suggestion. */
+  suggestPrevKey: string
   /** OpenAI-compatible endpoint for the classifier. */
   gateBaseUrl: string
   /** Model alias served at gateBaseUrl. */
@@ -63,8 +75,17 @@ export function loadLiveConfig(): LiveConfig {
     maxChars: num(live.maxChars, 800),
     useModel: bool(live.model, true),
     suggest: envBool("JEV_SUGGEST", bool(live.suggest, true)),
+    suggestMinChars: num(live.suggestMinChars, 2),
     suggestLimit: num(live.suggestLimit, 5),
+    suggestSources:
+      live.suggestSources === "idx" || live.suggestSources === "server"
+        ? live.suggestSources
+        : "both",
+    mention: envBool("JEV_MENTION", bool(live.mention, true)),
+    suggestDebounceMs: num(live.suggestDebounceMs, 250),
     acceptKey: typeof live.acceptKey === "string" ? live.acceptKey : "ctrl+shift+s",
+    suggestNextKey: typeof live.suggestNextKey === "string" ? live.suggestNextKey : "ctrl+shift+n",
+    suggestPrevKey: typeof live.suggestPrevKey === "string" ? live.suggestPrevKey : "ctrl+shift+p",
     gateBaseUrl:
       process.env.JEV_GATE_BASE_URL ??
       (typeof raw.gateBaseUrl === "string" ? raw.gateBaseUrl : "http://127.0.0.1:8082/v1"),
