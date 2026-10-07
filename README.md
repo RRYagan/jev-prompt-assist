@@ -22,7 +22,7 @@ well, route them, and feed the results back into the session.
 | Compaction safety | `experimental.session.compacting` | Carries the guide + recent decisions through compaction. |
 | Deterministic params | `chat.params` (`JEV_PARAMS=1`) | Pins temperature ≤0.2 for judge/review/plan/compaction/test-gen. |
 | Live prompt panel | `tui.tsx` (TUI plugin) | As you type, colours each sentence, shows a `score/100`, and suggests fixes. **Terminal TUI only.** |
-| Project autosuggest | `tui.tsx` + idx/server (`lib/tui/suggest.ts`) | Ranked `did you mean:` symbol/file matches (prefix/camelCase/subsequence/typo), `@`-mention mode, hot+recent boosts; cycle with `ctrl+shift+n/p` and accept with `ctrl+shift+s`. **Terminal TUI only.** |
+| Project autosuggest | `tui.tsx` + idx/server (`lib/tui/suggest.ts`) | Ranked `did you mean:` symbol/file matches (prefix/camelCase/subsequence/typo), `@`-mention mode, hot+recent boosts; cycle with `alt+n/p` and accept with `alt+s`. **Terminal TUI only.** |
 
 ## Layout
 
@@ -79,8 +79,8 @@ Matching is ranked: case-insensitive prefix → camelCase initialism (`gp` →
 `getProject`) → subsequence → substring → typo tolerance (edit distance 1).
 Files you are editing (git status) and identifiers already used earlier in the
 session are boosted. Typing `@` switches to file-mention mode (`@src/render.ts`).
-The list shows as `did you mean:`; `ctrl+shift+n` / `ctrl+shift+p` cycle and
-`ctrl+shift+s` accepts the selected candidate. Absent or unfinished indexes are
+The list shows as `did you mean:`; `alt+n` / `alt+p` cycle and
+`alt+s` accepts the selected candidate. Absent or unfinished indexes are
 ignored gracefully.
 
 Configure under the `live` key in `~/.config/opencode/jev/config.json`:
@@ -90,8 +90,8 @@ Configure under the `live` key in `~/.config/opencode/jev/config.json`:
             "minChars": 12, "maxChars": 800, "model": true,
             "suggest": true, "suggestMinChars": 2, "suggestLimit": 5,
             "suggestSources": "both", "mention": true, "suggestDebounceMs": 250,
-            "acceptKey": "ctrl+shift+s", "suggestNextKey": "ctrl+shift+n",
-            "suggestPrevKey": "ctrl+shift+p",
+            "acceptKey": "alt+s", "suggestNextKey": "alt+n",
+            "suggestPrevKey": "alt+p",
             "gateBaseUrl": "http://127.0.0.1:8082/v1",
             "gateModel": "jevify-gemma4-e4b" } }
 ```

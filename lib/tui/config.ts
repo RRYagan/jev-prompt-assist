@@ -83,9 +83,9 @@ export function loadLiveConfig(): LiveConfig {
         : "both",
     mention: envBool("JEV_MENTION", bool(live.mention, true)),
     suggestDebounceMs: num(live.suggestDebounceMs, 250),
-    acceptKey: typeof live.acceptKey === "string" ? live.acceptKey : "ctrl+shift+s",
-    suggestNextKey: typeof live.suggestNextKey === "string" ? live.suggestNextKey : "ctrl+shift+n",
-    suggestPrevKey: typeof live.suggestPrevKey === "string" ? live.suggestPrevKey : "ctrl+shift+p",
+    acceptKey: typeof live.acceptKey === "string" ? live.acceptKey : "alt+s",
+    suggestNextKey: typeof live.suggestNextKey === "string" ? live.suggestNextKey : "alt+n",
+    suggestPrevKey: typeof live.suggestPrevKey === "string" ? live.suggestPrevKey : "alt+p",
     gateBaseUrl:
       process.env.JEV_GATE_BASE_URL ??
       (typeof raw.gateBaseUrl === "string" ? raw.gateBaseUrl : "http://127.0.0.1:8082/v1"),

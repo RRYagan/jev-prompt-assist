@@ -232,8 +232,8 @@ idempotently, preserving other entries; `uninstall.sh` removes it.
             "minChars": 12, "maxChars": 800, "model": true,
             "suggest": true, "suggestMinChars": 2, "suggestLimit": 5,
             "suggestSources": "both", "mention": true, "suggestDebounceMs": 250,
-            "acceptKey": "ctrl+shift+s", "suggestNextKey": "ctrl+shift+n",
-            "suggestPrevKey": "ctrl+shift+p",
+            "acceptKey": "alt+s", "suggestNextKey": "alt+n",
+            "suggestPrevKey": "alt+p",
             "gateBaseUrl": "http://127.0.0.1:8082/v1",
             "gateModel": "jevify-gemma4-e4b" } }
 ```

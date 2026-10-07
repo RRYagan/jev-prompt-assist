@@ -43,9 +43,9 @@ describe("LivePanel", () => {
           { value: "@src/deploy.ts", label: "deploy.ts", detail: "src", kind: "mention" },
         ]}
         selected={() => 0}
-        acceptKey="ctrl+shift+s"
-        nextKey="ctrl+shift+n"
-        prevKey="ctrl+shift+p"
+        acceptKey="alt+s"
+        nextKey="alt+n"
+        prevKey="alt+p"
         theme={theme}
       />
     ))
