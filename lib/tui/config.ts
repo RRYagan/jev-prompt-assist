@@ -58,6 +58,16 @@ export type LiveConfig = {
   grammar: boolean
   /** Maximum grammar findings to show. */
   grammarLimit: number
+  /** Search the idx content index for the files/functions a draft talks about. */
+  context: boolean
+  /** Minimum draft length before a content search runs. */
+  contextMinChars: number
+  /** Maximum content hits to surface. */
+  contextLimit: number
+  /** Quiet period before the content search runs. */
+  contextDebounceMs: number
+  /** Where content suggestions may appear even without a typed fragment. */
+  contextSources: "auto" | "always" | "off"
   /** OpenAI-compatible endpoint for the classifier. */
   gateBaseUrl: string
   /** Model alias served at gateBaseUrl. */
@@ -119,6 +129,12 @@ export function loadLiveConfig(): LiveConfig {
     styleLimit: num(live.styleLimit, 6),
     grammar: envBool("JEV_GRAMMAR", bool(live.grammar, true)),
     grammarLimit: num(live.grammarLimit, 6),
+    context: envBool("JEV_CONTEXT", bool(live.context, true)),
+    contextMinChars: num(live.contextMinChars, 10),
+    contextLimit: num(live.contextLimit, 4),
+    contextDebounceMs: num(live.contextDebounceMs, 400),
+    contextSources:
+      live.contextSources === "always" || live.contextSources === "off" ? live.contextSources : "auto",
     gateBaseUrl:
       process.env.JEV_GATE_BASE_URL ??
       (typeof raw.gateBaseUrl === "string" ? raw.gateBaseUrl : "http://127.0.0.1:8082/v1"),

@@ -246,7 +246,8 @@ idempotently, preserving other entries; `uninstall.sh` removes it.
 ```
 
 Env: `JEV_LIVE=0` disable, `JEV_SUGGEST=0` disable suggestions,
-`JEV_MENTION=0` disable `@`-mentions, `JEV_STYLE=0` disable STE checks,
+`JEV_MENTION=0` disable `@`-mentions, `JEV_CONTEXT=0` disable the content-index
+source, `JEV_STYLE=0` disable STE checks,
 `JEV_GRAMMAR=0` disable grammar, `JEV_STE_DICT` / `JEV_GLOSSARY` data paths,
 `JEV_STE_UNKNOWN=1` flag unknown words, plus `JEV_GATE_BASE_URL` /
 `JEV_GATE_MODEL`. Debug: `JEV_TUI_DEBUG=1` (stderr traces),
@@ -292,19 +293,128 @@ cleared) and is wrapped in a Solid `<ErrorBoundary>` so a fault degrades to
 terminal-TUI only; the Electron/web UI would need a separate DOM-injection route
 and is not implemented here.
 
+## 9. Content index + multilanguage (v2.1)
+
+**Motivation.** The lexicon answers "what symbol am I typing?" but not "which
+code owns what I am asking for?". Typing a rough `update payment` produced
+nothing useful — the FTS half of the idx index was unused, and everything
+(tokenizing, `SPECIFIC`, the writing checks) assumed English.
+
+**Findings from the real index** (DukaLiteFull, snapshot `f2e9f705` ready, 1265
+files, `language_id` ∈ python/document/typescript):
+
+- `code_search_fts` is a full-text index of file *contents*. `file_path` holds
+  the **slug** (`src/a.ts src a ts`) while `source_path` holds the clean path;
+  `primary_symbol` holds `Name name in words`. Both slug forms are stripped
+  before anything is shown (`lib/tui/content.ts` `cleanFile`/`cleanSymbol`).
+- `symbols.kind` is **TEXT** in idx v2 ('function', 'class', …); the lexicon
+  used to coerce every kind to `0`, so `symbolKindLabel` rendered "" for every
+  real symbol. Numeric (idx v1 LSP) kinds still pass through.
+- Timing: one FTS `MATCH` 11 ms cold / 0.5 ms warm; a whole content search
+  (≈2 keywords + enrichment) 6–12 ms — cheap enough for the keystroke path.
+- `unicode61 remove_diacritics 2` must be mirrored exactly: fold only Latin
+  accents (blanket NFKD breaks `платежей` and `결제`), and a CJK run is one
+  token, hence the `LIKE` substring probe for bigrams.
+
+**Design.**
+
+- `lib/tui/keywords.ts` (pure) — Unicode tokenization → folded parts (camelCase,
+  `_`, `-`, `/` splits) → stopword/generic-action/extension filtering, plus
+  position-weighted ranking and the whole `snake_case` form kept as an FTS
+  phrase. The stop list is English plus the function words of es/pt/fr/de/it/nl,
+  so a request in another language does not burn its keyword slots on `el`, `le`
+  or `der` ("arreglar el reembolso de pagos" → `arreglar, reembolso, pagos`).
+  CJK runs become bigrams; `splitByScript` routes terms to FTS or `LIKE`.
+- `lib/tui/content.ts` — one `MATCH` per spaced keyword + a bounded `LIKE` per
+  packed keyword, grouped by file (`score = keywords × 1000 − |rank|`), then a
+  single `IN (…)` enrichment query for symbols + `files.language_id`. Cached
+  handle (60 s, keyed by mtime), `tableExists` guard, every SQL call in
+  try/catch, `[]` on any failure.
+- `lib/tui/context.ts` (pure) — `contextSuggestions()` emits the `sharpen:`
+  whole-draft rewrite (new `Suggestion.replaceAll`) and one append-only hit per
+  file; `draftPrompt()` keeps the user's wording and appends
+  `Target:` / `Symbols:` lines.
+- `lib/tui/script.ts` — dominant script of the draft; non-Latin drafts skip the
+  English-only grammar/STE tiers instead of drowning the user in false flags.
+- `tui.tsx` — debounced content pass (own timer, `contextSources` auto/always/off)
+  and `append`/`replaceAll` acceptance in `acceptSuggestion`.
+- `src/jev.ts` — `jev_context` tool: the same search server-side, returning
+  targets + a drafted prompt + notes. Also imports the shared `lib/tui/*`
+  readers (runtime-agnostic, no plugin SDK types), so TUI and server never drift.
+
+**Multilanguage polish.** `analyze.ts` `SPECIFIC` accepts Unicode
+paths/filenames/identifiers/CJK words; `suggest.ts` fragment/mention regexes use
+`\p{L}`/`\p{N}` (ASCII behaviour unchanged — `\p{Han}` is NOT supported by Bun
+1.4.2, use `\p{Script=Han}`); `isVague` keeps its English heuristics but now
+recognises targets in any script (`\p{Script=…}`, `snake_case`, digits,
+`@mention`), which strictly *reduces* false positives.
+
+**Result (measured, DukaLiteFull).** `searchContent("update payment for momo")`
+→ 6.3 ms, hits `sales_core/payment.py:230 checkout_payment`,
+`sync/apply/sales.py:349 _apply_momo_transaction`,
+`reports/reports.py:119 get_payment_method_breakdown`,
+`tests/test_payment_methods.py _reset_payment_settings` — i.e. the four places
+that own payment logic, found from a 23-character prompt.
+
+## 10. s1 wiring hardening (v2.1.1)
+
+The plugin is only useful if the classifier answers, and the default install
+(state of this machine: `s1-cpu.service` and `jev-gate.service` enabled but
+**inactive**) degraded into silent `s1 error:` strings. Fixed on two sides.
+
+**Bring-up.** `systemctl --user start s1-cpu` (:8081, Q5_K_M) and
+`scripts/setup-gate.sh`'s unit (:8082, Q4_K_M). Measured on this machine
+(12 cores, load avg ~16 from other LLM work):
+
+| call | CPU :8081 | gate :8082 |
+|---|---|---|
+| single `noul`, warm | 3.6 s | 1.3 s |
+| intent `ask` (2 questions, 155 tok state) | 16.2 s | 3.4 s |
+| first call after `systemctl start` | 11.3 s, then `503 Loading model` | ~25 s model load |
+| panel scoring, 5 sentences | – | 16.9 s |
+
+Prefill is the cost (~18 ms/token on the CPU server), so the intent questions
+were made terse (`INTENT_QUESTIONS` criteria shortened: 257 → 155 input tokens).
+Answer quality was checked to be route-independent: gate vs CPU agree on
+P(vague) within 0.01–0.03 across four prompts.
+
+**Code** (`src/jev.ts`, `lib/tui/s1.ts`):
+
+- interactive hooks (the intent hint) prefer the gate and **fall back** to the
+  resident route when the endpoint refuses a connection; the refusal is
+  remembered for 5 min, so the probe costs ~1 ms once;
+- `gate: true` in `jev_prompt` does *not* fall back — it reports the failure
+  with the command that fixes it (`hintFor`);
+- every s1 call is bounded (`JEV_S1_TIMEOUT_MS`, 30 s default, child killed) and
+  retried once on `503 Loading model`; failures are never cached;
+- `JEV_S1_BIN` selects the CLI binary (server plugin, and `lib/tui/s1.ts`);
+- the cache key now includes the route, so a CPU answer can never be replayed
+  for a gate request (they were colliding before);
+- the TUI panel's call budget grows with the number of sentences scored;
+- `craft()` tolerates an omitted `kind` (defensive: the tool schema default is
+  normally applied by the runtime).
+
+**Tests** (`tests/jevs1.test.ts`, 8 cases, no model): fake `s1` binary on disk
+records argv, so the tests assert the route flags (`--cpu` vs `--base-url …`),
+the cache hit path, the gate→CPU fallback via the `chat.message` hook, the
+timeout kill, and each actionable error hint.
+
 ## Verification
 
 - `bun build ~/.config/opencode/plugins/jev.ts --target=bun` (syntax/imports).
 - Server plugin: `bun build src/jev.ts --target=bun`; TUI half:
   `bun build tui.tsx --target=bun --packages external` (optional platform deps
   make a plain build fail — use `--packages external`).
-- `bun test tests` (heuristics, suggest matching, idx lexicon against a temp
-  SQLite fixture, STE rule engine with the 53-rule coverage assertion, grammar,
-  STE data loader, and a panel render/transition test), and tsc typecheck of
-  `tui.tsx` + `lib/tui/*`.
+- `bun test tests` (135 pass / 397 expects: heuristics, suggest matching and the
+  accept paths, idx lexicon against a temp SQLite fixture, keyword extraction,
+  content search against an FTS fixture, target/draft building, script
+  detection, STE rule engine with the 53-rule coverage assertion, grammar,
+  STE data loader, a panel render/transition test, and the s1 wiring tests
+  against a fake `s1` binary).
 - STE data: `node scripts/ste100-fetch.mjs` (downloads the private ASD dataset
   into `~/.config/opencode/jev/ste100/`; never committed — ASD copyright).
-- `s1 doctor --cpu` (endpoint + model + card example).
+- `s1 doctor --cpu` (endpoint + model + card example) — the first thing to run
+  when the plugin reports `cannot reach http://127.0.0.1:8081/v1`.
 - Gate: `scripts/setup-gate.sh` then `s1 noul --base-url http://127.0.0.1:8082/v1
   --model jevify-gemma4-e4b --state ... --question ...`.
 - TUI live panel: `JEV_TUI_SELFTEST=1 JEV_TUI_DEBUG=1 script -qec "timeout 12

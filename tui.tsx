@@ -17,10 +17,14 @@ import { loadLiveConfig, type LiveConfig } from "./lib/tui/config"
 import { heuristicAnalysis, mergeAnalysis, type Analysis } from "./lib/tui/analyze"
 import { scoreWithS1 } from "./lib/tui/s1"
 import { loadLexicon } from "./lib/tui/lexicon"
+import { searchContent } from "./lib/tui/content"
+import { contextSuggestions } from "./lib/tui/context"
+import { allowsEnglishLint } from "./lib/tui/script"
 import { lintSte, type StyleIssue } from "./lib/tui/style"
 import { lintGrammar } from "./lib/tui/grammar"
 import { loadSteData } from "./lib/tui/ste100"
 import {
+  applySuggestion,
   basename,
   currentFragment,
   currentMention,
@@ -86,31 +90,20 @@ function acceptSuggestion(shared: Shared): void {
     const current = ref.current
     const input = current?.input ?? ""
 
-    // Style/grammar finding: replace its exact source span. Advisories (no
-    // replacement) are not actionable, so accepting one is a no-op.
-    if (item.span) {
-      if (!item.value) return
-      const { start, end } = item.span
-      if (start < 0 || end > input.length || end <= start) return
-      const next = input.slice(0, start) + item.value + input.slice(end)
+    // Every branch lands here: publish the new draft and drop the list.
+    const commit = (next: string) => {
       ref.set({ input: next, parts: current?.parts ?? [] })
       ref.focus()
       shared.setItems([])
       shared.setSelected(0)
       shared.suppress = next
       shared.fragment = ""
-      return
     }
 
-    const fragment = shared.fragment
-    if (!fragment || !input.endsWith(fragment)) return
-    const next = input.slice(0, input.length - fragment.length) + item.value
-    ref.set({ input: next, parts: current?.parts ?? [] })
-    ref.focus()
-    shared.setItems([])
-    shared.setSelected(0)
-    shared.suppress = next
-    shared.fragment = ""
+    // Span (style/grammar), whole-draft rewrite (sharpen), appended target
+    // (@file), or the trailing fragment — all decided by `applySuggestion`.
+    const next = applySuggestion(input, shared.fragment, item)
+    if (next) commit(next)
   } catch {
     // never let the accept binding throw into the TUI
   }
@@ -235,7 +228,8 @@ function refreshRecent(api: TuiApi, shared: Shared, sessionID: string | undefine
         if ((part as { type?: string }).type !== "text") continue
         const text = (part as { text?: string }).text
         if (!text) continue
-        const matches = text.match(/[A-Za-z_$][A-Za-z0-9_$]{2,}/g)
+        // Unicode identifiers: `\p{L}` covers 支払い処理 or платежей, not just fooBar.
+        const matches = text.match(/[\p{L}_$@][\p{L}\p{N}_$]{2,}/gu)
         if (matches) for (const match of matches) recent.add(match.toLowerCase())
       }
     }
@@ -265,6 +259,7 @@ function PromptWithPanel(props: PanelProps) {
   let generation = 0
   let modelDebounce: ReturnType<typeof setTimeout> | undefined
   let suggestDebounce: ReturnType<typeof setTimeout> | undefined
+  let contextDebounce: ReturnType<typeof setTimeout> | undefined
   let hotTimer: ReturnType<typeof setInterval> | undefined
   let recentTimer: ReturnType<typeof setInterval> | undefined
 
@@ -316,10 +311,53 @@ function PromptWithPanel(props: PanelProps) {
     })
   }
 
+  // Content-index pass: search the idx index for the files/functions the draft
+  // talks about, and surface them as append-only targets plus a `sharpen:`
+  // rewrite. Never throws (searchContent swallows index errors), but the timer
+  // callback still guards the generation so a stale draft cannot win.
+  const runContext = (input: string, gen: number) => {
+    try {
+      const worktree = props.api.state?.path?.worktree
+      const hits = searchContent(worktree, input, { limit: props.cfg.contextLimit })
+      if (gen !== generation || hits.length === 0) return
+      const extra = contextSuggestions(input, hits, {
+        limit: props.cfg.contextLimit,
+        mention: props.cfg.mention,
+      })
+      if (extra.length === 0) return
+      const kept = props.shared.items().filter((item) => item.kind !== "context")
+      props.shared.setItems([...kept, ...extra])
+    } catch {
+      // diagnostics only: the panel must survive a broken index
+    }
+  }
+
+  /** Whether this draft is prose worth a content search (not a bare token). */
+  const wantsContext = (input: string, prefix: string): boolean => {
+    if (!props.cfg.context || props.cfg.contextSources === "off") return false
+    if (input.trim().length < props.cfg.contextMinChars) return false
+    if (props.cfg.contextSources === "always") return true
+    // auto: only when there is text before the token being completed. A lone
+    // identifier is a completion request, not a task description.
+    return prefix.trim().length >= 2
+  }
+
+  const scheduleContext = (input: string, prefix: string, gen: number) => {
+    if (contextDebounce) {
+      clearTimeout(contextDebounce)
+      contextDebounce = undefined
+    }
+    if (!wantsContext(input, prefix)) return
+    contextDebounce = setTimeout(() => runContext(input, gen), props.cfg.contextDebounceMs)
+  }
+
   // Style (STE) + grammar findings, converted to list entries. Best-effort:
-  // a missing dictionary or a rule error never breaks the panel.
+  // a missing dictionary or a rule error never breaks the panel. Both tiers
+  // are English-only, so they are skipped for a draft written in another
+  // script (otherwise every Japanese sentence draws spelling noise).
   const collectFindings = (input: string): Suggestion[] => {
     if (!props.cfg.style && !props.cfg.grammar) return []
+    if (!allowsEnglishLint(input)) return []
     const out: Suggestion[] = []
     try {
       if (props.cfg.grammar) {
@@ -362,6 +400,8 @@ function PromptWithPanel(props: PanelProps) {
 
     if (!props.cfg.suggest) {
       props.shared.setItems(findings)
+      // No completions to show, so the index pass is the only context source.
+      scheduleContext(input, input, gen)
       return
     }
     const mentionToken = props.cfg.mention ? currentMention(input) : undefined
@@ -370,6 +410,8 @@ function PromptWithPanel(props: PanelProps) {
     props.shared.fragment = fragment
     props.shared.mention = mention
     props.shared.setSelected(0)
+    // Prose (text before the token being completed) triggers the index pass.
+    scheduleContext(input, input.slice(0, input.length - fragment.length), gen)
 
     const query = mention ? fragment.slice(1) : fragment
     const min = mention ? 1 : props.cfg.suggestMinChars
@@ -414,6 +456,10 @@ function PromptWithPanel(props: PanelProps) {
       clearTimeout(suggestDebounce)
       suggestDebounce = undefined
     }
+    if (contextDebounce) {
+      clearTimeout(contextDebounce)
+      contextDebounce = undefined
+    }
 
     updateAssists(input, gen)
 
@@ -442,6 +488,21 @@ function PromptWithPanel(props: PanelProps) {
       { value: "deployPanels", label: "deployPanels", detail: "function · src/panel.ts", kind: "symbol" },
       { value: "@src/deploy.ts", label: "deploy.ts", detail: "src", kind: "mention" },
       {
+        value:
+          "fix the payment flow for momo\nTarget: src/modules/sales_core/payment.py\nSymbols: checkout_payment (payment.py:230)",
+        label: "sharpen: pin the indexed targets",
+        detail: "2 matches → Target + Symbols",
+        kind: "context",
+        replaceAll: true,
+      },
+      {
+        value: "@src/modules/sales_core/payment.py",
+        label: "checkout_payment",
+        detail: "…/modules/sales_core · L230 · python · matched: payment",
+        kind: "context",
+        append: true,
+      },
+      {
         value: "receive",
         label: "▲ spelling → receive",
         detail: "GM-spelling · use “receive”",
@@ -468,6 +529,7 @@ function PromptWithPanel(props: PanelProps) {
     if (poll) clearInterval(poll)
     if (modelDebounce) clearTimeout(modelDebounce)
     if (suggestDebounce) clearTimeout(suggestDebounce)
+    if (contextDebounce) clearTimeout(contextDebounce)
     if (hotTimer) clearInterval(hotTimer)
     if (recentTimer) clearInterval(recentTimer)
   })
@@ -519,7 +581,7 @@ const tui: TuiPluginModule["tui"] = async (api) => {
     accept: () => acceptSuggestion(shared),
     move: (delta) => moveSelection(shared, delta),
   }
-  if (cfg.suggest || cfg.style || cfg.grammar) {
+  if (cfg.suggest || cfg.style || cfg.grammar || cfg.context) {
     const bindings: Array<{ key: string; cmd: string }> = []
     if (cfg.acceptKey) bindings.push({ key: cfg.acceptKey, cmd: "jev.acceptSuggestion" })
     if (cfg.suggestNextKey) bindings.push({ key: cfg.suggestNextKey, cmd: "jev.nextSuggestion" })

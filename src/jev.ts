@@ -4,6 +4,9 @@ import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+import { searchContent, hasContentIndex, type ContentHit } from "../lib/tui/content"
+import { draftPrompt } from "../lib/tui/context"
+import { extractKeywords, splitByScript } from "../lib/tui/keywords"
 
 /**
  * jev — orchestration layer for the local Jev/System-1 classifier (s1).
@@ -11,6 +14,13 @@ import { dirname, join } from "node:path"
  * Wraps the `s1` CLI (Jevified Gemma-4-E4B, calibrated probabilities, zero
  * output tokens) with: prompt crafting, a content-hash cache, project/session
  * profiles, a system-prompt guide, and a triggered intent hint.
+ *
+ * The `jev_context` tool adds the other half: a rough request ("update
+ * payment", in any language) is matched against the project's shared idx
+ * content index, so the caller gets the files/symbols that own it and a
+ * drafted prompt naming them. The same readers back the TUI's live panel
+ * (`lib/tui/*`), and all of them are runtime-agnostic (no plugin SDK import),
+ * so the server plugin, the TUI and the tests share one implementation.
  *
  * Design constraints (measured): a short `noul` is ~1 s on CPU; prefill
  * dominates (~10 ms/token), so keep states short and batch questions over one
@@ -20,7 +30,8 @@ import { dirname, join } from "node:path"
  * Config precedence: defaults < ~/.config/opencode/jev/config.json < env < options.
  * Toggles: JEV_INTENT=0 (intent hint), JEV_GUIDE=0 (system guide),
  * JEV_CACHE=0 (content-hash cache), JEV_PARAMS=1 (temperature routing),
- * JEV_GATE_BASE_URL / JEV_GATE_MODEL (lightweight gate endpoint).
+ * JEV_GATE_BASE_URL / JEV_GATE_MODEL (lightweight gate endpoint),
+ * JEV_S1_BIN / JEV_S1_TIMEOUT_MS (s1 binary + call budget).
  */
 
 const PLUGIN_VERSION = 2
@@ -30,6 +41,18 @@ const CACHE_DIR = join(HOME, ".cache", "opencode", "jev")
 const SESSIONS_DIR = join(STATE_DIR, "sessions")
 const GUIDE_MARKER = "[JEV PROJECT GUIDE]"
 const HINT_MARK = "[jev-intent]"
+// s1 binary + call budget. Overridable so a non-PATH install (or a slow box)
+// can be accommodated without patching the plugin.
+const S1_BIN = process.env.JEV_S1_BIN || "s1"
+const S1_TIMEOUT_MS = Number(process.env.JEV_S1_TIMEOUT_MS) > 0 ? Number(process.env.JEV_S1_TIMEOUT_MS) : 30_000
+// How long a gate endpoint that refused a connection is skipped before the next
+// try. The probe is ~1 ms, but remembering keeps a misconfigured gate from
+// being retried on every message.
+const ROUTE_DOWN_COOLDOWN_MS = 5 * 60_000
+// llama-server answers 503 "Loading model" right after a (re)start; one retry
+// after a short pause turns a cold first call into a success.
+const LOADING_RETRY_DELAY_MS = 1500
+const DEFAULT_GATE_BASE_URL = "http://127.0.0.1:8082/v1"
 const SKIP_AGENTS = new Set(["judge", "compaction", "title", "summary", "scout", "explore", "test-gen"])
 // Agents whose work is deterministic enough to want a low sampling temperature
 // when `chat.params` routing is enabled (JEV_PARAMS=1).
@@ -41,6 +64,10 @@ type S1Result = {
   error?: string
   cached?: boolean
   latencyMs?: number
+  /** Which route produced the answer ("cpu", "gpu", "gate <url>"). */
+  route?: string
+  /** True when the s1 endpoint itself could not be reached. */
+  unreachable?: boolean
 }
 
 type RunArgs = {
@@ -60,6 +87,9 @@ type RunArgs = {
   baseUrl?: string
   model?: string
 }
+
+/** Route selection slice of a run: endpoint alias or explicit base URL. */
+type S1Route = Pick<RunArgs, "fast" | "baseUrl" | "model">
 
 // --------------------------------------------------------------------------- utils
 
@@ -125,23 +155,51 @@ function cacheKey(args: RunArgs): string {
       levels: args.levels ?? [],
       questions: args.questions ?? null,
       threshold: args.threshold ?? null,
+      // Route is part of the identity: the same question on the CPU server and
+      // on the gate must not share a cache entry.
+      fast: args.fast ?? false,
       baseUrl: args.baseUrl ?? "",
-      model: args.model ?? "",
+      model2: args.model ?? "",
     }),
   )
 }
 
 // --------------------------------------------------------------------------- s1 runner
 
-async function runS1(args: RunArgs, useCache = true): Promise<S1Result> {
-  const key = cacheKey(args)
-  const cachePath = join(CACHE_DIR, key + ".json")
-  if (useCache) {
-    const hit = readJSON<any>(cachePath, undefined as any)
-    if (hit) return { ok: true, raw: hit, cached: true }
-  }
+function routeLabel(route: S1Route): string {
+  if (route.baseUrl) return `gate ${route.baseUrl}`
+  return route.fast ? "gpu" : "cpu"
+}
 
-  const cmd = ["s1", args.mode, "--state", "-"]
+function isUnreachable(error?: string): boolean {
+  return !!error && /cannot reach|ECONNREFUSED|ECONNRESET|fetch failed|connection (refused|reset)/i.test(error)
+}
+
+/** Turn a raw s1 failure into something the caller can act on. */
+function hintFor(error: string, route: S1Route): string {
+  if (/not found in \$PATH|ENOENT/i.test(error)) {
+    return (
+      `${error} — the s1 CLI is not installed. Install it (see ~/.local/share/s1-adapter/README.md: ` +
+      "`uv tool install s1-adapter`) or point JEV_S1_BIN at the binary."
+    )
+  }
+  if (/Loading model|\b503\b/i.test(error)) {
+    return `${error} — the model is still loading; retry in a few seconds (\`s1 doctor\` reports readiness).`
+  }
+  if (isUnreachable(error)) {
+    const fix = route.baseUrl
+      ? `start the gate server (scripts/jev-gate-serve.sh, ${route.baseUrl})`
+      : route.fast
+        ? "start llama-swap (`systemctl --user start llama-swap`)"
+        : "start the CPU classifier (`systemctl --user start s1-cpu`)"
+    const probe = route.baseUrl ? ` --base-url ${route.baseUrl}` : route.fast ? "" : " --cpu"
+    return `${error} — ${fix}. Verify with \`s1 doctor${probe}\`.`
+  }
+  return error
+}
+
+async function spawnS1(args: RunArgs, route: S1Route, useCache: boolean): Promise<S1Result> {
+  const cmd = [S1_BIN, args.mode, "--state", "-"]
   if (args.baseUrl) {
     // Explicit endpoint (the lightweight gate model). --cpu/--gpu must NOT be
     // passed: cli.py lets them win over --base-url, so they'd ignore the gate.
@@ -173,26 +231,72 @@ async function runS1(args: RunArgs, useCache = true): Promise<S1Result> {
       stdout: "pipe",
       stderr: "pipe",
     })
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ])
-    const code = await proc.exited
+    // A hung s1 (unresponsive server, long model swap) must never stall a
+    // hook: the call is bounded and the child is killed on expiry.
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try {
+        proc.kill()
+      } catch {}
+    }, S1_TIMEOUT_MS)
+    let code: number
+    let stdout: string
+    let stderr: string
+    try {
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ])
+      stdout = out
+      stderr = err
+      code = await proc.exited
+    } finally {
+      clearTimeout(timer)
+    }
+    if (timedOut) {
+      return {
+        ok: false,
+        error: hintFor(`s1 timed out after ${S1_TIMEOUT_MS} ms (route ${routeLabel(route)})`, route),
+        route: routeLabel(route),
+      }
+    }
     const trimmed = stdout.trim()
     if (!trimmed) {
-      return { ok: false, error: stderr.trim() || `s1 exited ${code} with no output` }
+      const message = stderr.trim() || `s1 exited ${code} with no output`
+      return { ok: false, error: hintFor(message, route), route: routeLabel(route), unreachable: isUnreachable(message) }
     }
     let raw: any
     try {
       raw = JSON.parse(trimmed)
     } catch {
-      return { ok: false, error: trimmed || stderr.trim() }
+      return { ok: false, error: hintFor(trimmed, route), route: routeLabel(route) }
     }
-    if (useCache) writeJSON(cachePath, raw)
-    return { ok: true, raw, latencyMs: Date.now() - started }
+    if (useCache) writeJSON(join(CACHE_DIR, cacheKey(args) + ".json"), raw)
+    return { ok: true, raw, latencyMs: Date.now() - started, route: routeLabel(route) }
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, error: hintFor(message, route), route: routeLabel(route), unreachable: isUnreachable(message) }
   }
+}
+
+async function runS1(args: RunArgs, useCache = true): Promise<S1Result> {
+  const key = cacheKey(args)
+  const cachePath = join(CACHE_DIR, key + ".json")
+  if (useCache) {
+    const hit = readJSON<any>(cachePath, undefined as any)
+    if (hit) return { ok: true, raw: hit, cached: true, route: routeLabel(args) }
+  }
+
+  const route: S1Route = { fast: args.fast, baseUrl: args.baseUrl, model: args.model }
+  let result = await spawnS1(args, route, useCache)
+  // 503 "Loading model": llama-server is up but still mmap-ing. One retry is
+  // enough and keeps the first call after `systemctl --user start` from failing.
+  for (let attempt = 0; !result.ok && /Loading model|\b503\b/i.test(result.error ?? "") && attempt < 1; attempt++) {
+    await Bun.sleep(LOADING_RETRY_DELAY_MS)
+    result = await spawnS1(args, route, useCache)
+  }
+  return result
 }
 
 // --------------------------------------------------------------------------- verification
@@ -362,13 +466,18 @@ function record(sessionID: string | undefined, entry: Record<string, unknown>): 
 
 const VAGUE_RE = /\b(it|this|that|thing|stuff|something|somehow|whatever|etc)\b/i
 const ACTION_RE = /\b(fix|improve|clean\s?up|refactor|update|change|optimi[sz]e|make .* better)\b/i
+// "Concrete target" test for the action-verb rule, script independent: a path
+// separator, a backtick, an @mention, a digit, a camelCase or snake_case
+// identifier, or any non-Latin word (CJK/Hangul requests usually name their
+// subject in their own script).
+const TARGET_RE = /[./\\`@\d]|[a-z][A-Z]|[a-z]+_[a-z]+|\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Hangul}/u
 
 function isVague(text: string): boolean {
   const trimmed = text.trim()
   if (trimmed.length < 6 || trimmed.length > 400) return false
   if (trimmed.startsWith("/")) return false
   if (trimmed.length < 90 && VAGUE_RE.test(trimmed)) return true
-  if (trimmed.length < 60 && ACTION_RE.test(trimmed) && !/[./\\`]/.test(trimmed)) return true
+  if (trimmed.length < 60 && ACTION_RE.test(trimmed) && !TARGET_RE.test(trimmed)) return true
   return false
 }
 
@@ -383,28 +492,69 @@ function lastTextPart(parts: any[]): any | undefined {
 const HINT_COOLDOWN_MS = 20_000
 const lastHintAt = new Map<string, number>()
 
+// One batched `ask` over the turn. Prefill dominates on CPU (~18 ms/token under
+// load), so the wording is kept terse: the criteria still disambiguate the
+// labels but cost a third of the tokens of a prose version (measured 257 → 155
+// input tokens, ~4.5 s → ~3.4 s on the gate).
 const INTENT_QUESTIONS = {
   kind: {
     type: "choice",
-    instructions: "What kind of work does this request ask for?",
+    instructions: "What kind of work is this?",
     criteria: {
-      "code-change": "Add, modify, or remove code behavior",
-      debug: "Diagnose or fix a failure, error, or crash",
-      research: "Find, read, explain, or compare information",
-      config: "Change config, environment, deps, or tooling",
-      question: "Answer a question with no repository change",
-      other: "None of the above",
+      "code-change": "add, change or remove code behavior",
+      debug: "diagnose or fix a failure",
+      research: "find, read or explain code",
+      config: "config, deps or tooling",
+      question: "answer a question only",
+      other: "none of the above",
     },
   },
   vague: {
     type: "noul",
-    instructions:
-      "Would a senior engineer need at least one clarifying question before starting, or is the request actionable as written?",
+    instructions: "Actionable as written, with a concrete target and outcome?",
     criteria: {
-      true: "The request omits the target, scope, or acceptance criteria needed to start",
-      false: "The request names a concrete target and a clear outcome",
+      true: "missing target, scope or acceptance criteria",
+      false: "names a concrete target and outcome",
     },
   },
+}
+
+// --------------------------------------------------------------------------- context index
+
+/** One target as compact text lines: `1. path:line — symbol (language)` + extras. */
+function renderTarget(index: number, hit: ContentHit): string[] {
+  const place = hit.line ? `${hit.file}:${hit.line}` : hit.file
+  const tags = [hit.language, hit.more ? `+${hit.more} more` : ""].filter(Boolean).join(", ")
+  const suffix = tags ? ` (${tags})` : ""
+  const head = hit.symbol ? `${place} — ${hit.symbol}${suffix}` : `${place}${suffix}`
+  const lines = [`${index}. ${head}`]
+  if (hit.signature) lines.push(`   ${hit.signature}`)
+  if (hit.snippet) lines.push(`   excerpt: ${hit.snippet.slice(0, 140)}`)
+  if (hit.keywords.length) lines.push(`   matched: ${hit.keywords.join(" ")}`)
+  return lines
+}
+
+/** Guidance for the caller: whether the index is usable, and what is missing. */
+function contextNotes(task: string, hits: readonly ContentHit[], worktree: string, keywords: string[]): string[] {
+  const notes: string[] = []
+  if (!hasContentIndex(worktree)) {
+    notes.push("No idx content index for this worktree — run `idx index`, or pass `worktree` for an indexed project.")
+  } else if (hits.length === 0) {
+    notes.push("No indexed file mentions those keywords — broaden the wording, or re-index.")
+    if (splitByScript(keywords).packed.length > 0)
+      notes.push("CJK-style keywords are matched by substring; add a Latin identifier, filename, or error text for sharper targets.")
+  } else {
+    const top = hits[0]!
+    const runnerUp = hits[1]
+    if (runnerUp && top.score > runnerUp.score * 1.5)
+      notes.push(`One file dominates (${top.file}) — check the rest for the same logic before editing.`)
+    if (keywords.length === 1) notes.push("Only one keyword matched; add a specific noun for sharper targets.")
+    const languages = [...new Set(hits.map((hit) => hit.language).filter(Boolean))] as string[]
+    if (languages.length > 1) notes.push(`Languages in the targets: ${languages.join(", ")}.`)
+  }
+  const words = task.split(/\s+/).filter(Boolean).length
+  if (task && words < 4) notes.push("Short request — attach acceptance criteria so the work can be verified.")
+  return notes
 }
 
 // --------------------------------------------------------------------------- plugin
@@ -424,11 +574,13 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
     guide: envBool("JEV_GUIDE", fileBool("guide", true)),
     cache: envBool("JEV_CACHE", fileBool("cache", true)),
     maxStateChars: typeof fileConfig.maxStateChars === "number" ? fileConfig.maxStateChars : 4000,
-    // Lightweight "gate" endpoint for cheap interactive judgments. When unset,
-    // interactive hooks fall back to the resident CPU server (--cpu).
+    // Lightweight "gate" endpoint for cheap interactive judgments. Defaults to
+    // the endpoint scripts/jev-gate-serve.sh starts (mirroring the TUI's live
+    // config); interactive calls fall back to the resident CPU server when it
+    // is not running, and `gate: true` in the tool reports it as an error.
     gateBaseUrl:
       process.env.JEV_GATE_BASE_URL ??
-      (typeof fileConfig.gateBaseUrl === "string" ? fileConfig.gateBaseUrl : ""),
+      (typeof fileConfig.gateBaseUrl === "string" ? fileConfig.gateBaseUrl : DEFAULT_GATE_BASE_URL),
     gateModel:
       process.env.JEV_GATE_MODEL ??
       (typeof fileConfig.gateModel === "string" ? fileConfig.gateModel : ""),
@@ -443,11 +595,30 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
     if (typeof options.gateModel === "string") config.gateModel = options.gateModel
   }
 
+  // Endpoints that refused a connection are remembered for a while, so a
+  // missing gate costs one probe instead of one per message.
+  const routeDownUntil = new Map<string, number>()
+  const markRouteDown = (baseUrl: string) => {
+    routeDownUntil.set(baseUrl, Date.now() + ROUTE_DOWN_COOLDOWN_MS)
+  }
+  const routeUp = (baseUrl: string) => Date.now() >= (routeDownUntil.get(baseUrl) ?? 0)
+
   // Backend selection for a run. `gate` targets the lightweight endpoint when
   // configured; otherwise it degrades to the normal cpu/gpu route.
-  const backend = (useGate: boolean): Pick<RunArgs, "fast" | "baseUrl" | "model"> => {
+  const backend = (useGate: boolean): S1Route => {
     if (useGate && config.gateBaseUrl) return { baseUrl: config.gateBaseUrl, model: config.gateModel || undefined }
     return { fast: config.fast }
+  }
+
+  // Interactive hooks run on every message, so they take the cheap gate while it
+  // answers and fall back to the resident route when it does not.
+  const runInteractive = async (args: Omit<RunArgs, "fast" | "baseUrl" | "model">): Promise<S1Result> => {
+    const gate = config.gateBaseUrl
+    const useGate = !!gate && routeUp(gate)
+    const result = await runS1({ ...args, ...backend(useGate) }, config.cache)
+    if (result.ok || !useGate || !result.unreachable) return result
+    markRouteDown(gate!)
+    return runS1({ ...args, fast: config.fast }, config.cache)
   }
 
   const jevPrompt = tool({
@@ -488,7 +659,7 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
     },
     async execute(args, ctx) {
       const state = normalizeState(args.state ?? "", config.maxStateChars)
-      const crafted = craft(args.task, args.kind, args.options, args.levels, args.trueCriterion, args.falseCriterion)
+      const crafted = craft(args.task, args.kind ?? "auto", args.options, args.levels, args.trueCriterion, args.falseCriterion)
       const lines = renderCrafted(crafted, state, config.fast)
 
       if (!args.run) {
@@ -509,12 +680,14 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
         ...backend(args.gate),
       }
       const result = await runS1(runArgs, config.cache)
+      if (!result.ok && result.unreachable && runArgs.baseUrl) markRouteDown(runArgs.baseUrl)
 
       lines.push("")
       if (result.ok) {
         const payload = result.raw?.result ?? result.raw?.answers ?? result.raw
         lines.push(`result${result.cached ? " (cached)" : ""}: ${JSON.stringify(payload)}`)
         if (result.raw?.latency_ms !== undefined) lines.push(`latency_ms: ${result.raw.latency_ms}`)
+        if (result.route) lines.push(`route: ${result.route}`)
         if (result.raw?.action) lines.push(`action: ${result.raw.action}`)
         if (args.verify) {
           const check = await consistencyCheck(crafted, state, runArgs, config.cache)
@@ -534,8 +707,72 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
     },
   })
 
+  // Rough request -> the files and symbols in this repo that own it. Purely
+  // local: reads the idx content index the same way the TUI does.
+  const jevContext = tool({
+    description:
+      "Turn a rough request ('update payment', any language) into the concrete " +
+      "targets in this repository by searching the shared idx content index " +
+      "(<worktree>/.indexer-cli/db.sqlite, read-only). Returns the matching " +
+      "files, symbols, signatures and lines, then a drafted prompt that names " +
+      "those targets and carries your acceptance criteria. Use it before acting " +
+      "on an under-specified task, and to reuse the knowledge already indexed.",
+    args: {
+      task: tool.schema.string().describe("The rough request, in any language"),
+      worktree: tool.schema
+        .string()
+        .optional()
+        .describe("Directory to search (defaults to the project of this session)"),
+      limit: tool.schema.number().optional().describe("Max hits to return (default 6, max 20)"),
+      detail: tool.schema
+        .boolean()
+        .default(true)
+        .describe("Attach language, signature and doc comment to each hit"),
+      draft: tool.schema
+        .boolean()
+        .default(true)
+        .describe("Include a drafted prompt that names the targets"),
+      maxFiles: tool.schema
+        .number()
+        .optional()
+        .describe("Files named in the drafted Target line (default 3)"),
+      criteria: tool.schema.string().optional().describe("Acceptance criteria for the drafted prompt"),
+    },
+    async execute(args) {
+      const worktree = (args.worktree ?? "").trim() || directory
+      const task = String(args.task ?? "").trim()
+      const limit = Math.max(1, Math.min(20, Math.floor(args.limit ?? 6)))
+      const maxFiles = Math.max(1, Math.min(10, Math.floor(args.maxFiles ?? 3)))
+
+      const lines: string[] = [`JEV CONTEXT — ${task || "(no task)"}`, `worktree: ${worktree}`]
+      const keywords = extractKeywords(task, { limit: 5 })
+      if (keywords.length) lines.push(`keywords: ${keywords.join(", ")}`)
+
+      const hits = searchContent(worktree, task, { limit, detail: args.detail !== false })
+      lines.push("")
+      lines.push(`targets (${hits.length}):`)
+      for (const [index, hit] of hits.entries()) lines.push(...renderTarget(index + 1, hit))
+
+      if (args.draft !== false) {
+        const drafted = draftPrompt(task, hits, maxFiles)
+        const criteria = (args.criteria ?? "").trim()
+        lines.push("")
+        lines.push("drafted prompt:")
+        lines.push(criteria ? `${drafted}\nCriteria: ${criteria}` : drafted)
+      }
+
+      const notes = contextNotes(task, hits, worktree, keywords)
+      if (notes.length) {
+        lines.push("")
+        lines.push("notes:")
+        for (const note of notes) lines.push(`  - ${note}`)
+      }
+      return lines.join("\n")
+    },
+  })
+
   return {
-    tool: { jev_prompt: jevPrompt },
+    tool: { jev_prompt: jevPrompt, jev_context: jevContext },
 
     // Inject the project's classification guide into the system prompt (opt-in
     // via .opencode/jev.json or the global ~/.config/opencode/jev/guide.md).
@@ -555,7 +792,9 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
     },
 
     // Cheap vague-prompt detection, then one batched s1 call over the turn.
-    // Gated + debounced so it does not add ~1 s to every message.
+    // Gated by the heuristic, debounced per session (HINT_COOLDOWN_MS) and run
+    // on the gate with a fallback to the resident route, so it costs ~4 s on a
+    // message that already looked under-specified — never on every message.
     "chat.message": async (input, output) => {
       if (!config.intentHint) return
       try {
@@ -567,15 +806,11 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
         const last = lastHintAt.get(input.sessionID) ?? 0
         if (now - last < HINT_COOLDOWN_MS) return
 
-        const result = await runS1(
-          {
-            mode: "ask",
-            state: normalizeState(part.text, 1500),
-            questions: INTENT_QUESTIONS,
-            ...backend(true),
-          },
-          config.cache,
-        )
+        const result = await runInteractive({
+          mode: "ask",
+          state: normalizeState(part.text, 1500),
+          questions: INTENT_QUESTIONS,
+        })
         if (!result.ok || !result.raw?.answers) return
         lastHintAt.set(input.sessionID, now)
 
@@ -585,13 +820,16 @@ const plugin: Plugin = async ({ directory }, options?: PluginOptions) => {
         const confidence = typeof kindAns?.confidence === "number" ? kindAns.confidence : undefined
         const vagueP = typeof answers.vague?.noul === "number" ? answers.vague.noul : undefined
         if (!kind && vagueP === undefined) return
-        if (kind && (confidence ?? 0) < 0.5 && !(vagueP !== undefined && vagueP >= 0.6)) return
+        // The heuristic already filtered, so s1 only has to agree roughly for a
+        // nudge; a confident kind alone still earns one (it labels the work).
+        const vagueEnough = vagueP !== undefined && vagueP >= 0.5
+        if (kind && (confidence ?? 0) < 0.5 && !vagueEnough) return
 
         const kindText = kind ?? "unknown"
         const confText = confidence !== undefined ? ` (conf ${confidence.toFixed(2)})` : ""
         const vagueText =
-          vagueP !== undefined && vagueP >= 0.6
-            ? "looks under-specified — pin the exact target and acceptance criteria before acting"
+          vagueEnough
+            ? `${vagueP >= 0.6 ? "looks" : "may look"} under-specified — pin the exact target and acceptance criteria before acting`
             : "actionable as written"
         part.text = part.text.trimEnd() + `\n\n${HINT_MARK} classified: ${kindText}${confText}; ${vagueText}.`
       } catch {}

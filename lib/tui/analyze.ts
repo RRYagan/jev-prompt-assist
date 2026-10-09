@@ -52,8 +52,11 @@ const ACTION =
   /^(add|remove|delete|fix|refactor|rename|implement|write|update|change|create|move|extract|test|document|optimize|improve|investigate|explain|find|check|verify|ensure|make|build|run|convert|migrate|support|handle|avoid|reduce|simplify|clean|use|replace|revert|review)\b/i
 const CRITERIA =
   /\b(must|should|so\s+that|so\s+it|acceptance|expected|verify|ensure|test\s+that|when\s+.+\s+then|within|without|instead\s+of|edge\s+case|error|cover|only|exactly|before|after)\b/i
+// A concrete target is anything a reader could act on. `\p{L}`/`\p{N}` (not
+// `\w`) so that `src/支払い.py`, `결제.py` and `datos/opciones.ts` all count,
+// and a CJK run stands in for "a word" in space-less scripts.
 const SPECIFIC =
-  /(`[^`]+`|[\w.-]+\.(?:ts|tsx|js|jsx|py|go|rs|json|md|yaml|yml|toml|sh|css|html|sql)|\/[\w./-]+|\b\d+\b|\b[A-Za-z_]\w*\()/
+  /(`[^`]+`|@[\p{L}\p{N}_$./-]+|[\p{L}\p{N}_\-.]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|json|md|yaml|yml|toml|sh|css|html|sql|vue|svelte)|\/[\p{L}\p{N}_.\-/]+|\b\d+\b|[\p{L}_$][\p{L}\p{N}_$]*\(|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{2,})/u
 const QUESTION_START = /^(what|why|how|when|where|who|which|can|could|should|is|are|do|does|did)\b/i
 
 function clamp(value: number): number {

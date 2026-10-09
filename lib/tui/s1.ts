@@ -100,7 +100,9 @@ export async function scoreWithS1(segments: string[], opts: S1Options): Promise<
   const cached = readCache(file)
   if (cached) return cached
 
-  const s1 = process.env.S1_BIN ?? "s1"
+  // Same binary the server plugin uses (JEV_S1_BIN), with S1_BIN kept as the
+  // older alias for anyone who already set it.
+  const s1 = process.env.JEV_S1_BIN ?? process.env.S1_BIN ?? "s1"
   const cmd = [
     s1,
     "ask",
@@ -113,7 +115,11 @@ export async function scoreWithS1(segments: string[], opts: S1Options): Promise<
     "--model",
     opts.model,
   ]
-  const stdout = await run(cmd, state, opts.timeoutMs ?? 20000)
+  // Prefill dominates and the questions are batched over one state prefix:
+  // budget grows with the number of sentences scored (measured ~3.3 s per
+  // noul question on the CPU gate under load).
+  const budget = opts.timeoutMs ?? Math.min(90_000, 20_000 + 4_000 * segments.length)
+  const stdout = await run(cmd, state, budget)
   if (!stdout) return null
 
   let parsed: S1Payload | null = null

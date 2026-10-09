@@ -13,17 +13,30 @@
 
 export type LexiconEntry = {
   name: string
+  /** LSP numeric kind, or the idx text kind ("function", "class", …). */
   kind: number | string
   file: string
   signature?: string
+  /** Leading doc comment / docstring, when the index carries one. */
+  doc?: string
+  /** Enclosing container (class/module), when the index carries one. */
+  container?: string
+  /** Whether the symbol is exported/public. */
+  exported?: boolean
+  /** 1-based start line of the symbol, when the index carries one. */
+  line?: number
 }
 
 export type Lexicon = {
   symbols: LexiconEntry[]
   paths: string[]
+  /** Distinct language ids seen in the index (e.g. "typescript", "python"). */
+  languages?: string[]
+  /** Language per indexed file path, for language-aware hints. */
+  languageOf?: Record<string, string>
 }
 
-export type SuggestionKind = "symbol" | "path" | "mention" | "style"
+export type SuggestionKind = "symbol" | "path" | "mention" | "style" | "context"
 
 export type SuggestionSeverity = "error" | "warn" | "info"
 
@@ -39,6 +52,10 @@ export type Suggestion = {
   span?: { start: number; end: number }
   /** Severity, for style/grammar findings (drives colour). */
   severity?: SuggestionSeverity
+  /** Replace the whole draft instead of just the fragment/span. */
+  replaceAll?: boolean
+  /** Append at the end of the draft instead of replacing the fragment. */
+  append?: boolean
 }
 
 export type SuggestOptions = {
@@ -53,8 +70,10 @@ export type SuggestOptions = {
 
 // The token under the cursor. There is no cursor API in TuiPromptRef, so we
 // treat the end of the draft as the cursor and match the trailing run.
-const FRAGMENT = /([A-Za-z_$][A-Za-z0-9_$./-]*)$/
-const MENTION = /@([A-Za-z0-9_$./-]*)$/
+// `\p{L}`/`\p{N}` keep ASCII behaviour identical while also matching
+// non-Latin identifiers and words (日本語, Привет, café, العربية).
+const FRAGMENT = /([\p{L}\p{N}_$][\p{L}\p{N}_$./-]*)$/u
+const MENTION = /@([\p{L}\p{N}_$./-]*)$/u
 
 export function currentFragment(input: string): string {
   const match = FRAGMENT.exec(input)
@@ -70,6 +89,33 @@ export function currentMention(input: string): string | undefined {
 export function basename(path: string): string {
   const slash = path.lastIndexOf("/")
   return slash >= 0 ? path.slice(slash + 1) : path
+}
+
+/**
+ * The draft after accepting `item`, or undefined when it is not actionable.
+ *
+ * Four shapes, checked in order:
+ *  - `span`  — a style/grammar finding: splice its replacement into the span.
+ *  - `replaceAll` — a content `sharpen:` rewrite: the value is the whole draft.
+ *  - `append` — a content target: add `@file` to the end (single space glue,
+ *    never a leading/trailing one).
+ *  - otherwise a completion: replace the trailing `fragment`.
+ */
+export function applySuggestion(input: string, fragment: string, item: Suggestion): string | undefined {
+  if (item.span) {
+    if (!item.value) return undefined
+    const { start, end } = item.span
+    if (start < 0 || end > input.length || end <= start) return undefined
+    return input.slice(0, start) + item.value + input.slice(end)
+  }
+  if (item.replaceAll) return item.value || undefined
+  if (item.append) {
+    if (!item.value) return undefined
+    const glue = !input || /\s$/.test(input) ? "" : " "
+    return input + glue + item.value
+  }
+  if (!fragment || !input.endsWith(fragment)) return undefined
+  return input.slice(0, input.length - fragment.length) + item.value
 }
 
 export function dirname(path: string): string {
