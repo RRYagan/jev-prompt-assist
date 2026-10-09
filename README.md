@@ -295,3 +295,5 @@ itself, not a bundle. Use `--packages external` to bundle it anyway.)
   this (MIT) repo. `tests/style.test.ts` asserts every one of the 53 rules is
   accounted for as auto / advisory / manual.
 - dsh integration is **deferred** (opencode-only for now); see `PLAN.md` §7.
+
+##NB: STILL UNDER DEVELOPMENT
