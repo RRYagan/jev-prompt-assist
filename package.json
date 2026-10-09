@@ -1,7 +1,7 @@
 {
   "name": "opencode-plugin-jev-prompt-assist",
   "version": "0.2.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "opencode plugin for the local Jev/System-1 (s1) classifier: prompt crafting, self-consistency verify, gate routing, project guides, token-efficient decisions, and a live TUI prompt-clarity panel.",
   "license": "MIT",
